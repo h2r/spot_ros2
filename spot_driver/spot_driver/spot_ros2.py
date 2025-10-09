@@ -501,6 +501,8 @@ class SpotROS(Node):
             self.frame_prefix = self.name + "/" if self.name is not None else ""
 
         self.tf_name_graph_nav_body: str = self.frame_prefix + "body"
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # logger for spot wrapper
         name_with_dot = ""
@@ -626,6 +628,9 @@ class SpotROS(Node):
             )
             self.create_subscription(
                 PoseStamped, "arm_pose_commands", self.arm_pose_cmd_callback, 100, callback_group=self.group
+            )
+            self.create_subscription(
+                PoseStamped, "arm_pose_body_follow_commands", self.arm_pose_cmd_body_follow_callback, 100, callback_group=self.group
             )
             self.create_subscription(
                 ArmVelocityCommandRequest,
@@ -2701,6 +2706,41 @@ class SpotROS(Node):
             ref_frame=data.header.frame_id,
             ensure_power_on_and_stand=False,
             blocking=False,
+        )
+        if not result[0]:
+            self.get_logger().warning(f"Failed to go to arm pose: {result[1]}")
+        else:
+            self.get_logger().info("Successfully went to arm pose")
+    
+    def arm_pose_cmd_body_follow_callback(self, data: PoseStamped) -> None:
+        if not self.spot_wrapper:
+            self.get_logger().info(f"Mock mode, received arm pose command {data}")
+            return
+
+        # transform to odom frame if not already
+        if data.header.frame_id != "odom":
+            data.header.frame_id = self.tf_prefix + "/" + data.header.frame_id
+            try:
+                now = rclpy.time.Time()
+                self.tf_buffer.can_transform("odom", data.header.frame_id, now, timeout=rclpy.duration.Duration(seconds=1.0))
+                transformed = self.tf_buffer.transform(data, "odom")
+                data = transformed
+            except Exception as e:
+                self.get_logger().error(f"Failed to transform arm pose command to odom frame: {e}")
+                return
+
+        result = self.spot_wrapper.spot_arm.hand_pose(
+            x=data.pose.position.x,
+            y=data.pose.position.y,
+            z=data.pose.position.z,
+            qx=data.pose.orientation.x,
+            qy=data.pose.orientation.y,
+            qz=data.pose.orientation.z,
+            qw=data.pose.orientation.w,
+            ref_frame="odom",
+            ensure_power_on_and_stand=False,
+            blocking=False,
+            body_follow_hand=True,
         )
         if not result[0]:
             self.get_logger().warning(f"Failed to go to arm pose: {result[1]}")
