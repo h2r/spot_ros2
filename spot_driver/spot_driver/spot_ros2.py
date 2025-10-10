@@ -486,6 +486,7 @@ class SpotROS(Node):
 
         self.cmd_duration: float = self.get_parameter("cmd_duration").value
         self.arm_cmd_duration: float = self.get_parameter("arm_cmd_duration").value
+        self.arm_pose_cmd_duration: float = self.get_parameter("arm_pose_cmd_duration").value
 
         self.username: str = get_from_env_and_fall_back_to_param("BOSDYN_CLIENT_USERNAME", self, "username", "user")
         self.password: str = get_from_env_and_fall_back_to_param("BOSDYN_CLIENT_PASSWORD", self, "password", "password")
@@ -2703,6 +2704,7 @@ class SpotROS(Node):
             qy=data.pose.orientation.y,
             qz=data.pose.orientation.z,
             qw=data.pose.orientation.w,
+            duration=self.arm_pose_cmd_duration,
             ref_frame=data.header.frame_id,
             ensure_power_on_and_stand=False,
             blocking=False,
