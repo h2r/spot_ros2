@@ -22,6 +22,7 @@ import rclpy.duration
 import rclpy.time
 import synchros2.process as ros_process
 import tf2_ros
+import tf2_geometry_msgs
 from bondpy.bondpy import Bond
 from bosdyn.api import (
     arm_command_pb2,
@@ -380,6 +381,7 @@ class SpotROS(Node):
         self.declare_parameter("estop_timeout", 9.0)
         self.declare_parameter("cmd_duration", 0.125)
         self.declare_parameter("arm_cmd_duration", 1.0)
+        self.declare_parameter("arm_pose_cmd_duration", 2.0)
         self.declare_parameter("start_estop", False)
         self.declare_parameter("rgb_cameras", True)
 
@@ -2643,7 +2645,7 @@ class SpotROS(Node):
         if not self.spot_wrapper:
             self.get_logger().info(f"Mock mode, received command vel {data}")
             return
-        self.spot_wrapper.velocity_cmd(data.linear.x, data.linear.y, data.angular.z, self.cmd_duration)
+        self.spot_wrapper.velocity_cmd(data.linear.x, data.linear.y, data.angular.z, None, self.cmd_duration)
 
     def body_pose_callback(self, data: Pose) -> None:
         """Callback for cmd_vel command"""
@@ -2721,11 +2723,12 @@ class SpotROS(Node):
 
         # transform to odom frame if not already
         if data.header.frame_id != "odom":
-            data.header.frame_id = self.tf_prefix + "/" + data.header.frame_id
+            if data.header.frame_id != "map":
+                data.header.frame_id = self.frame_prefix or "" + data.header.frame_id
             try:
                 now = rclpy.time.Time()
-                self.tf_buffer.can_transform("odom", data.header.frame_id, now, timeout=rclpy.duration.Duration(seconds=1.0))
-                transformed = self.tf_buffer.transform(data, "odom")
+                self.tf_buffer.can_transform(self.frame_prefix or "" + "odom", data.header.frame_id, now, timeout=rclpy.duration.Duration(seconds=1.0))
+                transformed = self.tf_buffer.transform(data, self.frame_prefix or "" + "odom")
                 data = transformed
             except Exception as e:
                 self.get_logger().error(f"Failed to transform arm pose command to odom frame: {e}")
