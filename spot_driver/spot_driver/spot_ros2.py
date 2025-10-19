@@ -23,6 +23,7 @@ import rclpy.time
 import synchros2.process as ros_process
 import tf2_ros
 import tf2_geometry_msgs
+import tf_transformations
 from bondpy.bondpy import Bond
 from bosdyn.api import (
     arm_command_pb2,
@@ -504,7 +505,7 @@ class SpotROS(Node):
             self.frame_prefix = self.name + "/" if self.name is not None else ""
 
         self.tf_name_graph_nav_body: str = self.frame_prefix + "body"
-        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(nanoseconds=int(1e9)))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # logger for spot wrapper
@@ -622,6 +623,9 @@ class SpotROS(Node):
 
         self.create_subscription(Twist, "cmd_vel", self.cmd_velocity_callback, 1, callback_group=self.group)
         self.create_subscription(Pose, "body_pose", self.body_pose_callback, 1, callback_group=self.group)
+        self.create_subscription(
+            PoseStamped, "navigate_to_pose", self.navigate_to_pose_callback, 1, callback_group=self.group
+        )
 
         self.create_trigger_services()
 
@@ -1529,7 +1533,7 @@ class SpotROS(Node):
         except Exception as e:
             response.success = False
             response.message = f"Error: {e}"
-            return response
+            return responsef
 
     def handle_load_sound(self, request: LoadSound.Request, response: LoadSound.Response) -> LoadSound.Response:
         """ROS service handler for loading a wav file sound on Spot CAM."""
@@ -2666,6 +2670,89 @@ class SpotROS(Node):
         mobility_params = self.spot_wrapper.get_mobility_params()
         mobility_params.body_control.CopyFrom(body_control)
         self.spot_wrapper.set_mobility_params(mobility_params)
+    
+    def navigate_to_pose_callback(self, data: PoseStamped) -> None:
+        """Fire-and-forget callback for navigating to a pose.
+
+        This is similar to the trajectory action server but without feedback/monitoring.
+        Receives a PoseStamped and sends it as a trajectory command to the robot.
+
+        Args:
+            data: PoseStamped message containing target pose in the specified frame
+        """
+        if self.spot_wrapper is None:
+            self.get_logger().info(f"Mock mode, received navigate to pose: {data}")
+            return
+
+        # Transform pose to supported frame if necessary
+        frame_name = data.header.frame_id.replace(self.frame_prefix, "")  # Remove namespace prefix
+
+        # Determine target frame for trajectory_cmd
+        if frame_name not in ["body"]:
+            self.get_logger().warn(f"Unsupported frame for navigate_to: {frame_name}")
+            return
+
+        # Extract target position from transformed pose
+        goal_x = data.pose.position.x
+        goal_y = data.pose.position.y
+
+        # Extract heading from quaternion
+        # Convert quaternion to yaw angle
+        quat = [
+            data.pose.orientation.x,
+            data.pose.orientation.y,
+            data.pose.orientation.z,
+            data.pose.orientation.w
+        ]
+        euler = tf_transformations.euler_from_quaternion(quat)
+        goal_heading = euler[2]  # yaw
+
+        # Calculate duration from timestamp
+        # If timestamp is set to future time, use that as the target time
+        # Otherwise, use a default duration
+        if data.header.stamp.sec == 0 and data.header.stamp.nanosec == 0:
+            # No timestamp set, use default duration
+            cmd_duration = 1.0
+            self.get_logger().debug("No timestamp in PoseStamped, using default duration of 1.0s")
+        else:
+            # Calculate time difference between target time and current time
+            target_time = rclpy.time.Time.from_msg(data.header.stamp)
+            current_time = self.get_clock().now()
+            duration_msg = target_time - current_time
+            cmd_duration = duration_msg.nanoseconds / 1e9
+            print(f"Calculated command duration based on timestamp: {cmd_duration:.2f}s")
+
+            # Ensure duration is positive and reasonable
+            if cmd_duration <= 0.0:
+                self.get_logger().warn(
+                    f"Target time is in the past (duration={cmd_duration:.2f}s), using default 1.0s"
+                )
+                cmd_duration = 1.0
+            elif cmd_duration > 60.0:
+                self.get_logger().warn(
+                    f"Target time is too far in future (duration={cmd_duration:.2f}s), clamping to 60.0s"
+                )
+                cmd_duration = 60.0
+
+        self.get_logger().info(
+            f"Navigate to pose: frame={frame_name}, "
+            f"x={goal_x:.2f}m, y={goal_y:.2f}m, heading={goal_heading:.2f}rad "
+            f"(duration={cmd_duration:.2f}s)"
+        )
+
+        # Send trajectory command (fire-and-forget)
+        success, message = self.spot_wrapper.trajectory_cmd(
+            goal_x=goal_x,
+            goal_y=goal_y,
+            goal_heading=goal_heading,
+            cmd_duration=cmd_duration,
+            frame_name="vision", # we pass in body frame, but use vision for the final converted frame
+            precise_position=False,  # Less strict for fire-and-forget
+        )
+
+        if not success:
+            self.get_logger().error(f"Failed to send navigate to pose command: {message}")
+
 
     def arm_joint_cmd_callback(self, data: JointState) -> None:
         if not self.spot_wrapper:
