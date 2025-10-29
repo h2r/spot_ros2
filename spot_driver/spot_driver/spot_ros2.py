@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from std_msgs.msg import Float32
+
 import builtin_interfaces.msg
 import numpy as np
 import rclpy
@@ -68,7 +70,7 @@ from geometry_msgs.msg import Pose, PoseStamped, TransformStamped, Twist
 from rclpy import Parameter
 from rclpy.action import ActionServer
 from rclpy.action.server import ServerGoalHandle
-from rclpy.callback_groups import CallbackGroup, MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import CallbackGroup, MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.clock import Clock
 from rclpy.impl import rcutils_logger
 from rclpy.publisher import Publisher
@@ -369,6 +371,7 @@ class SpotROS(Node):
         self.callbacks["metrics"] = self.metrics_callback
 
         self.group: CallbackGroup = MutuallyExclusiveCallbackGroup()
+        self.arm_gripper_callback_group: CallbackGroup = ReentrantCallbackGroup()
         self.graph_nav_callback_group: CallbackGroup = MutuallyExclusiveCallbackGroup()
 
         self.declare_parameter("auto_claim", False)
@@ -631,30 +634,37 @@ class SpotROS(Node):
 
         if self.has_arm:
             self.create_subscription(
-                JointState, "arm_joint_commands", self.arm_joint_cmd_callback, 100, callback_group=self.group
+                JointState, "arm_joint_commands", self.arm_joint_cmd_callback, 100, callback_group=self.arm_gripper_callback_group
             )
             self.create_subscription(
-                PoseStamped, "arm_pose_commands", self.arm_pose_cmd_callback, 100, callback_group=self.group
+                PoseStamped, "arm_pose_commands", self.arm_pose_cmd_callback, 100, callback_group=self.arm_gripper_callback_group
             )
             self.create_subscription(
-                PoseStamped, "arm_pose_body_follow_commands", self.arm_pose_cmd_body_follow_callback, 100, callback_group=self.group
+                PoseStamped, "arm_pose_body_assist_commands", self.arm_pose_cmd_body_assist_callback, 100, callback_group=self.arm_gripper_callback_group
+            )
+            self.create_subscription(
+                PoseStamped, "arm_pose_body_follow_commands", self.arm_pose_cmd_body_follow_callback, 100, callback_group=self.arm_gripper_callback_group
             )
             self.create_subscription(
                 ArmVelocityCommandRequest,
                 "arm_velocity_commands",
                 self.arm_velocity_cmd_callback,
                 100,
-                callback_group=self.group,
+                callback_group=self.arm_gripper_callback_group,
             )
 
             if not self.gripperless:
+                self.create_subscription(
+                    Float32,
+                    "gripper_angle_command", self.gripper_angle_cmd_callback, 100, callback_group=self.arm_gripper_callback_group
+                )
                 self.create_service(
                     SetGripperAngle,
                     "set_gripper_angle",
                     lambda request, response: self.service_wrapper(
                         "set_gripper_angle", self.handle_gripper_angle, request, response
                     ),
-                    callback_group=self.group,
+                    callback_group=self.arm_gripper_callback_group,
                 )
 
         self.create_service(
@@ -2649,6 +2659,7 @@ class SpotROS(Node):
         if not self.spot_wrapper:
             self.get_logger().info(f"Mock mode, received command vel {data}")
             return
+        self.get_logger().info(f"Received cmd_vel: linear_x={data.linear.x}, linear_y={data.linear.y}, angular_z={data.angular.z}")
         self.spot_wrapper.velocity_cmd(data.linear.x, data.linear.y, data.angular.z, None, self.cmd_duration)
 
     def body_pose_callback(self, data: Pose) -> None:
@@ -2803,6 +2814,49 @@ class SpotROS(Node):
         else:
             self.get_logger().info("Successfully went to arm pose")
     
+
+    def arm_pose_cmd_body_assist_callback(self, data: PoseStamped) -> None:
+        if not self.spot_wrapper:
+            self.get_logger().info(f"Mock mode, received arm pose command {data}")
+            return
+
+        # transform to odom frame if not already
+        previous_timestamp = data.header.stamp
+        if data.header.frame_id != "odom":
+            if data.header.frame_id != "map":
+                data.header.frame_id = (self.frame_prefix or "") + data.header.frame_id
+            data.header.stamp = (self.get_clock().now() - rclpy.duration.Duration(seconds=1.0)).to_msg()
+            target_frame = (self.frame_prefix or "") + "odom"
+            source_frame = data.header.frame_id
+            try:
+                now = rclpy.time.Time()
+                self.tf_buffer.can_transform(target_frame, source_frame, now, timeout=rclpy.duration.Duration(seconds=1.0))
+                transformed = self.tf_buffer.transform(data, target_frame)
+                data = transformed
+            except Exception as e:
+                self.get_logger().error(f"Failed to transform arm pose command to odom frame: {e}")
+                return
+
+        result = self.spot_wrapper.spot_arm.hand_pose(
+            x=data.pose.position.x,
+            y=data.pose.position.y,
+            z=data.pose.position.z,
+            qx=data.pose.orientation.x,
+            qy=data.pose.orientation.y,
+            qz=data.pose.orientation.z,
+            qw=data.pose.orientation.w,
+            ref_frame="odom",
+            ensure_power_on_and_stand=False,
+            blocking=False,
+            body_follow_hand=False,
+            body_hip_height_assist=True
+        )
+        if not result[0]:
+            self.get_logger().warning(f"Failed to go to arm pose: {result[1]}")
+        else:
+            self.get_logger().info("Successfully went to arm pose")
+
+
     def arm_pose_cmd_body_follow_callback(self, data: PoseStamped) -> None:
         if not self.spot_wrapper:
             self.get_logger().info(f"Mock mode, received arm pose command {data}")
@@ -2811,11 +2865,14 @@ class SpotROS(Node):
         # transform to odom frame if not already
         if data.header.frame_id != "odom":
             if data.header.frame_id != "map":
-                data.header.frame_id = self.frame_prefix or "" + data.header.frame_id
+                data.header.frame_id = (self.frame_prefix or "") + data.header.frame_id
+            target_frame = (self.frame_prefix or "") + "odom"
+            source_frame = data.header.frame_id
+            data.header.stamp = (self.get_clock().now() - rclpy.duration.Duration(seconds=1.0)).to_msg()
             try:
                 now = rclpy.time.Time()
-                self.tf_buffer.can_transform(self.frame_prefix or "" + "odom", data.header.frame_id, now, timeout=rclpy.duration.Duration(seconds=1.0))
-                transformed = self.tf_buffer.transform(data, self.frame_prefix or "" + "odom")
+                self.tf_buffer.can_transform(target_frame, source_frame, now, timeout=rclpy.duration.Duration(seconds=1.0))
+                transformed = self.tf_buffer.transform(data, target_frame)
                 data = transformed
             except Exception as e:
                 self.get_logger().error(f"Failed to transform arm pose command to odom frame: {e}")
@@ -2854,6 +2911,21 @@ class SpotROS(Node):
                 self.get_logger().error(f"Failed to execute arm velocity command: {message}")
         except Exception as e:
             self.get_logger().error(f"Failed to convert arm velocity command: {e}")
+    
+
+    def gripper_angle_cmd_callback(self, gripper_command: Float32) -> None:
+        if not self.spot_wrapper:
+            self.get_logger().info(f"Mock mode, received gripper command {gripper_command.data}")
+            return
+        self.get_logger().info(f"Received gripper command: {gripper_command.data}")
+        result = self.spot_wrapper.spot_arm.gripper_angle_open_nonblocking(
+            gripper_ang=gripper_command.data
+        )
+        if not result[0]:
+            self.get_logger().warning(f"Failed to go to gripper position: {result[1]}")
+        else:
+            self.get_logger().info("Successfully went to gripper position")
+
 
     def handle_graph_nav_get_localization_pose(
         self,
