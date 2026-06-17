@@ -6,6 +6,7 @@
 #include <google/protobuf/duration.pb.h>
 #include <google/protobuf/timestamp.pb.h>
 #include <builtin_interfaces/msg/duration.hpp>
+#include <iostream>
 #include <optional>
 #include <spot_driver/api/time_sync_api.hpp>
 #include <spot_driver/conversions/common_conversions.hpp>
@@ -113,7 +114,16 @@ std::optional<sensor_msgs::msg::JointState> getJointStates(const ::bosdyn::api::
   joint_states.header.stamp = robotTimeToLocalTime(robot_state.kinematic_state().acquisition_timestamp(), clock_skew);
 
   for (const auto& joint : robot_state.kinematic_state().joint_states()) {
-    const auto joint_name = prefix + kFriendlyJointNames.at(joint.name());
+    const auto friendly_name_it = kFriendlyJointNames.find(joint.name());
+    if (friendly_name_it == kFriendlyJointNames.end()) {
+      // The robot reported a joint name we don't have a URDF-friendly mapping for (e.g. a
+      // different hardware/payload configuration). Skip it instead of crashing the whole
+      // state publisher via std::map::at().
+      std::cerr << "[spot_driver] getJointStates: unrecognized joint name from robot state: '"
+                << joint.name() << "'; skipping this joint." << std::endl;
+      continue;
+    }
+    const auto joint_name = prefix + friendly_name_it->second;
     joint_states.name.push_back(joint_name);
     joint_states.position.push_back(joint.position().value());
     joint_states.velocity.push_back(joint.velocity().value());

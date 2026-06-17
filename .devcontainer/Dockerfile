@@ -29,7 +29,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update -q && \
 
 RUN source "/opt/ros/${ROS_DISTRO}/setup.bash"
 
-ARG SPOT_SDK_VERSION="5.0.1"
+ARG SPOT_SDK_VERSION="5.1.4"
 ARG SPOT_MSG_VERSION="${SPOT_SDK_VERSION}"
 
 # Install bosdyn_msgs package

@@ -151,7 +151,14 @@ from spot_msgs.srv import (  # type: ignore
     UploadSequence,
 )
 from spot_msgs.srv import RobotCommand as RobotCommandService  # type: ignore
-from spot_wrapper.cam_wrapper import SpotCamCamera, SpotCamWrapper
+try:
+    from spot_wrapper.cam_wrapper import SpotCamCamera, SpotCamWrapper
+    SPOTCAM_AVAILABLE = True
+except ImportError:
+    SpotCamCamera = None
+    SpotCamWrapper = None
+    SPOTCAM_AVAILABLE = False
+    print("Warning: SpotCam functionality not available (aiortc not installed)")
 from spot_wrapper.spot_leash import SpotLeashContextProtocol, SpotLeashProtocol
 from spot_wrapper.wrapper import SpotWrapper
 
@@ -371,7 +378,9 @@ class SpotROS(Node):
         self.callbacks["metrics"] = self.metrics_callback
 
         self.group: CallbackGroup = MutuallyExclusiveCallbackGroup()
+        self.arm_callback_group: CallbackGroup = ReentrantCallbackGroup()
         self.arm_gripper_callback_group: CallbackGroup = ReentrantCallbackGroup()
+        self.navigate_to_pose_callback_group: CallbackGroup = ReentrantCallbackGroup()
         self.graph_nav_callback_group: CallbackGroup = MutuallyExclusiveCallbackGroup()
 
         self.declare_parameter("auto_claim", False)
@@ -508,8 +517,8 @@ class SpotROS(Node):
             self.frame_prefix = self.name + "/" if self.name is not None else ""
 
         self.tf_name_graph_nav_body: str = self.frame_prefix + "body"
-        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(nanoseconds=int(1e9)))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(nanoseconds=int(1e9)))
+        # self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # logger for spot wrapper
         name_with_dot = ""
@@ -579,18 +588,21 @@ class SpotROS(Node):
 
             self.spot_cam_wrapper = None
             if self.initialize_spot_cam:
-                try:
-                    self.cam_logger = rcutils_logger.RcutilsLogger(name=f"{name_with_dot}spot_cam_wrapper")
-                    self.spot_cam_wrapper = SpotCamWrapper(
-                        hostname=self.ip,
-                        username=self.username,
-                        password=self.password,
-                        port=self.port,
-                        logger=self.cam_logger,
-                        cert_resource_glob=self.certificate,
-                    )
-                except SystemError:
-                    self.spot_cam_wrapper = None
+                if not SPOTCAM_AVAILABLE:
+                    self.get_logger().warning("SpotCam requested but aiortc not available. Skipping SpotCam initialization.")
+                else:
+                    try:
+                        self.cam_logger = rcutils_logger.RcutilsLogger(name=f"{name_with_dot}spot_cam_wrapper")
+                        self.spot_cam_wrapper = SpotCamWrapper(
+                            hostname=self.ip,
+                            username=self.username,
+                            password=self.password,
+                            port=self.port,
+                            logger=self.cam_logger,
+                            cert_resource_glob=self.certificate,
+                        )
+                    except SystemError:
+                        self.spot_cam_wrapper = None
 
             if self.frame_prefix != self.spot_wrapper.frame_prefix:
                 error_msg = (
@@ -627,32 +639,15 @@ class SpotROS(Node):
         self.create_subscription(Twist, "cmd_vel", self.cmd_velocity_callback, 1, callback_group=self.group)
         self.create_subscription(Pose, "body_pose", self.body_pose_callback, 1, callback_group=self.group)
         self.create_subscription(
-            PoseStamped, "navigate_to_pose", self.navigate_to_pose_callback, 1, callback_group=self.group
+            PoseStamped, "navigate_to_pose", self.navigate_to_pose_callback, 1, callback_group=self.navigate_to_pose_callback_group
+        )
+        self.create_subscription(
+            PoseStamped, "navigate_to_pose_no_obstacle", self.navigate_to_pose_no_obstacle_callback, 1, callback_group=self.navigate_to_pose_callback_group
         )
 
         self.create_trigger_services()
 
         if self.has_arm:
-            self.create_subscription(
-                JointState, "arm_joint_commands", self.arm_joint_cmd_callback, 100, callback_group=self.arm_gripper_callback_group
-            )
-            self.create_subscription(
-                PoseStamped, "arm_pose_commands", self.arm_pose_cmd_callback, 100, callback_group=self.arm_gripper_callback_group
-            )
-            self.create_subscription(
-                PoseStamped, "arm_pose_body_assist_commands", self.arm_pose_cmd_body_assist_callback, 100, callback_group=self.arm_gripper_callback_group
-            )
-            self.create_subscription(
-                PoseStamped, "arm_pose_body_follow_commands", self.arm_pose_cmd_body_follow_callback, 100, callback_group=self.arm_gripper_callback_group
-            )
-            self.create_subscription(
-                ArmVelocityCommandRequest,
-                "arm_velocity_commands",
-                self.arm_velocity_cmd_callback,
-                100,
-                callback_group=self.arm_gripper_callback_group,
-            )
-
             if not self.gripperless:
                 self.create_subscription(
                     Float32,
@@ -666,6 +661,25 @@ class SpotROS(Node):
                     ),
                     callback_group=self.arm_gripper_callback_group,
                 )
+            self.create_subscription(
+                JointState, "arm_joint_commands", self.arm_joint_cmd_callback, 100, callback_group=self.arm_callback_group
+            )
+            self.create_subscription(
+                PoseStamped, "arm_pose_commands", self.arm_pose_cmd_callback, 100, callback_group=self.arm_callback_group
+            )
+            # self.create_subscription(
+            #     PoseStamped, "arm_pose_body_assist_commands", self.arm_pose_cmd_body_assist_callback, 100, callback_group=self.arm_callback_group
+            # )
+            # self.create_subscription(
+            #     PoseStamped, "arm_pose_body_follow_commands", self.arm_pose_cmd_body_follow_callback, 100, callback_group=self.arm_callback_group
+            # )
+            self.create_subscription(
+                ArmVelocityCommandRequest,
+                "arm_velocity_commands",
+                self.arm_velocity_cmd_callback,
+                100,
+                callback_group=self.arm_callback_group,
+            )
 
         self.create_service(
             SetStandHeight,
@@ -1271,6 +1285,19 @@ class SpotROS(Node):
                 body_frame=self.tf_name_graph_nav_body,
                 return_tf=True,
             )
+
+            # GraphNav can report a waypoint_id before seed_tform_body is fully populated,
+            # momentarily yielding a degenerate (all-zero) quaternion. Since this is published
+            # via a StaticTransformBroadcaster, publishing it would latch a broken transform
+            # until the next valid update. Skip and retry on the next timer tick instead.
+            rot = seed_t_body_trans_msg.transform.rotation
+            quat_norm_sq = rot.x**2 + rot.y**2 + rot.z**2 + rot.w**2
+            if quat_norm_sq < 1e-9:
+                self.get_logger().warning(
+                    "GraphNav localization reported a degenerate orientation; skipping this TF update."
+                )
+                return
+
             self.graph_nav_pose_pub.publish(seed_t_body_msg)
             self.graph_nav_pose_transform_broadcaster.sendTransform(seed_t_body_trans_msg)
         except Exception as e:
@@ -1815,6 +1842,8 @@ class SpotROS(Node):
                 raise Exception("Spot CAM has not been initialized")
 
             tag = None if request.tag == "" else request.tag
+            if not SPOTCAM_AVAILABLE:
+                raise Exception("SpotCam functionality not available (aiortc not installed)")
             camera_name = SpotCamCamera(request.name)  # Silly but don't want to modify cam wrapper.
             proto_logpoint = self.spot_cam_wrapper.media_log.store(camera_name, tag)
             convert(proto_logpoint, response.logpoint)
@@ -2682,7 +2711,19 @@ class SpotROS(Node):
         mobility_params.body_control.CopyFrom(body_control)
         self.spot_wrapper.set_mobility_params(mobility_params)
     
-    def navigate_to_pose_callback(self, data: PoseStamped) -> None:
+
+    def navigate_to_pose_no_obstacle_callback(self, data: PoseStamped) -> None:
+        """Fire-and-forget callback for navigating to a pose without obstacle avoidance.
+
+        This is similar to the trajectory action server but without feedback/monitoring.
+        Receives a PoseStamped and sends it as a trajectory command to the robot.
+
+        Args:
+            data: PoseStamped message containing target pose in the specified frame
+        """
+        self.navigate_to_pose_callback(data, obstacle_avoidance=False)
+    
+    def navigate_to_pose_callback(self, data: PoseStamped, obstacle_avoidance=True) -> None:
         """Fire-and-forget callback for navigating to a pose.
 
         This is similar to the trajectory action server but without feedback/monitoring.
@@ -2759,6 +2800,7 @@ class SpotROS(Node):
             cmd_duration=cmd_duration,
             frame_name="vision", # we pass in body frame, but use vision for the final converted frame
             precise_position=False,  # Less strict for fire-and-forget
+            disable_vision_body_obstacle_avoidance=obstacle_avoidance,
         )
 
         if not success:
@@ -2793,6 +2835,7 @@ class SpotROS(Node):
         self.spot_wrapper.arm_joint_cmd(**arm_joint_map)
 
     def arm_pose_cmd_callback(self, data: PoseStamped) -> None:
+        self.get_logger().debug(f"Arm pose orig command received in frame: {data.header.frame_id}")
         if not self.spot_wrapper:
             self.get_logger().info(f"Mock mode, received arm pose command {data}")
             return
@@ -2821,12 +2864,15 @@ class SpotROS(Node):
             return
 
         # transform to odom frame if not already
+        # REF_FRAME = "odom"
+        REF_FRAME = "odom"
+        self.get_logger().info(f"Arm pose command received in frame: {data.header.frame_id}")
         previous_timestamp = data.header.stamp
-        if data.header.frame_id != "odom":
+        if data.header.frame_id != REF_FRAME:
             if data.header.frame_id != "map":
                 data.header.frame_id = (self.frame_prefix or "") + data.header.frame_id
-            data.header.stamp = (self.get_clock().now() - rclpy.duration.Duration(seconds=1.0)).to_msg()
-            target_frame = (self.frame_prefix or "") + "odom"
+            data.header.stamp = (self.get_clock().now() - rclpy.duration.Duration(seconds=0.5)).to_msg()
+            target_frame = (self.frame_prefix or "") + REF_FRAME
             source_frame = data.header.frame_id
             try:
                 now = rclpy.time.Time()
@@ -2845,7 +2891,7 @@ class SpotROS(Node):
             qy=data.pose.orientation.y,
             qz=data.pose.orientation.z,
             qw=data.pose.orientation.w,
-            ref_frame="odom",
+            ref_frame=REF_FRAME,
             ensure_power_on_and_stand=False,
             blocking=False,
             body_follow_hand=False,
@@ -2861,6 +2907,7 @@ class SpotROS(Node):
         if not self.spot_wrapper:
             self.get_logger().info(f"Mock mode, received arm pose command {data}")
             return
+        self.get_logger().info(f"Arm pose body follow command received in frame: {data.header.frame_id}")
 
         # transform to odom frame if not already
         if data.header.frame_id != "odom":
@@ -2868,7 +2915,7 @@ class SpotROS(Node):
                 data.header.frame_id = (self.frame_prefix or "") + data.header.frame_id
             target_frame = (self.frame_prefix or "") + "odom"
             source_frame = data.header.frame_id
-            data.header.stamp = (self.get_clock().now() - rclpy.duration.Duration(seconds=1.0)).to_msg()
+            data.header.stamp = (self.get_clock().now() - rclpy.duration.Duration(seconds=0.5)).to_msg()
             try:
                 now = rclpy.time.Time()
                 self.tf_buffer.can_transform(target_frame, source_frame, now, timeout=rclpy.duration.Duration(seconds=1.0))
